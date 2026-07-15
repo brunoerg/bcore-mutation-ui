@@ -4,6 +4,19 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Bitcoin Core — Mutation Testing Dashboard</title>
+<!-- SPA deep-link restore: decodes the ?/… path that 404.html produced on
+     GitHub Pages back into a clean URL before the app boots. See 404.html. -->
+<script>
+  (function (l) {
+    if (l.search[1] === '/') {
+      var decoded = l.search.slice(1).split('&').map(function (s) {
+        return s.replace(/~and~/g, '&');
+      }).join('?');
+      window.history.replaceState(null, null,
+        l.pathname.slice(0, -1) + decoded + l.hash);
+    }
+  }(window.location));
+</script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap">
 <style>
@@ -655,7 +668,7 @@
 // ── DATA ──────────────────────────────────────────────────────────────────────
 
 async function loadData() {
-  const res = await fetch('public/mutation_data.json');
+  const res = await fetch('/public/mutation_data.json');
   const data = await res.json();
 
   window.DB        = { mutants: data.mutants, runs: data.runs };
@@ -677,6 +690,99 @@ let fileSearchQuery  = '';
 
 // Populated in init() after DB is loaded — must NOT reference DB at top level
 let testedFiles = {};
+
+// ── URL ROUTING ───────────────────────────────────────────────────────────────
+// URL shapes (all shareable / bookmarkable, backed by 404.html on GitHub Pages):
+//   /                                            weekly overview
+//   /src/net_processing.cpp                      weekly, file selected
+//   /src/net_processing.cpp#3434                 weekly, file + mutant 3434
+//   /pull                                        PR list
+//   /pull/35221                                  PR detail
+//   /pull/35221/src/net_processing.cpp           PR, file selected
+//   /pull/35221/src/net_processing.cpp#2416      PR, file + mutant 2416
+let suppressUrlUpdate = false;   // true while we mutate state to match the URL
+
+function parseRoute() {
+  let path = window.location.pathname.replace(/^\/+/, '').replace(/\/+$/, '');
+  try { path = decodeURIComponent(path); } catch (e) {}
+  const rawHash = window.location.hash.replace(/^#/, '');
+  const mutant = /^\d+$/.test(rawHash) ? parseInt(rawHash, 10) : null;
+  const route = { view: 'weekly', pr: null, file: null, mutant };
+
+  if (path === '') return route;
+  if (path === 'pull') { route.view = 'pr'; return route; }
+  if (path.indexOf('pull/') === 0) {
+    route.view = 'pr';
+    const rest = path.slice('pull/'.length);
+    const slash = rest.indexOf('/');
+    if (slash === -1) { route.pr = rest; }
+    else { route.pr = rest.slice(0, slash); route.file = rest.slice(slash + 1); }
+    return route;
+  }
+  route.file = path;   // weekly file
+  return route;
+}
+
+function buildUrl() {
+  let path;
+  if (selectedPr !== null) {
+    path = '/pull/' + selectedPr + (selectedFile ? '/' + selectedFile : '');
+  } else if (currentView === 'pr') {
+    path = '/pull';
+  } else {
+    path = selectedFile ? '/' + selectedFile : '/';
+  }
+  return path + (selectedMutantId !== null ? '#' + selectedMutantId : '');
+}
+
+function syncUrl() {
+  if (suppressUrlUpdate) return;
+  const url = buildUrl();
+  if (url !== window.location.pathname + window.location.hash) {
+    history.pushState(null, '', url);
+  }
+}
+
+// Drive app state from a parsed route. Suppresses URL writes so the address bar
+// stays the source of truth (used on first load and on back/forward).
+function applyRoute(route) {
+  suppressUrlUpdate = true;
+  try {
+    if (route.view === 'pr') {
+      if (currentView !== 'pr') switchView('pr');
+      if (route.pr && PR_DATA[route.pr]) {
+        if (selectedPr !== route.pr) selectPr(route.pr);
+        if (route.file && testedFiles[route.file]) {
+          if (selectedFile !== route.file) selectFile(route.file);
+          selectMutantIfPresent(route.mutant, route.file);
+        } else if (selectedFile !== null) {
+          selectPr(route.pr);   // re-render PR overview, clear file
+        }
+      } else if (selectedPr !== null) {
+        backToPrList();
+      }
+    } else {
+      if (currentView !== 'weekly') switchView('weekly');
+      if (route.file && testedFiles[route.file]) {
+        if (selectedFile !== route.file) selectFile(route.file);
+        selectMutantIfPresent(route.mutant, route.file);
+      } else if (selectedFile !== null) {
+        backToOverview();
+      }
+    }
+  } finally {
+    suppressUrlUpdate = false;
+  }
+}
+
+function selectMutantIfPresent(id, file) {
+  if (id === null) return;
+  const pool = selectedPr ? (PR_DATA[selectedPr]?.mutants || []) : DB.mutants;
+  if (pool.some(m => m.id === id && m.file_path === file)) selectMutant(id);
+}
+
+window.addEventListener('popstate', () => applyRoute(parseRoute()));
+window.addEventListener('hashchange', () => applyRoute(parseRoute()));
 
 // ── INIT ──────────────────────────────────────────────────────────────────────
 function init() {
@@ -705,6 +811,11 @@ function init() {
     file_cmds:   window.FILE_CMDS,
     testedFiles: { ...testedFiles },
   };
+
+  // Apply the deep link from the address bar, then canonicalise it (drops any
+  // trailing slash or a stale file/mutant that no longer exists).
+  applyRoute(parseRoute());
+  history.replaceState(null, '', buildUrl());
 }
 
 // ── HELPERS ───────────────────────────────────────────────────────────────────
@@ -877,6 +988,7 @@ function selectFile(path) {
   document.querySelectorAll('.file-item').forEach(el =>
     el.classList.toggle('active', el.dataset.path === path));
   renderFileDetail(path);
+  syncUrl();
   if (window.innerWidth <= 768) closeSidebar();
 }
 
@@ -1007,8 +1119,10 @@ function renderFileDetail(path) {
 
 function backToOverview() {
   selectedFile = null;
+  selectedMutantId = null;
   document.querySelectorAll('.file-item').forEach(el => el.classList.remove('active'));
   renderOverview();
+  syncUrl();
 }
 // ── MUTANT LIST ───────────────────────────────────────────────────────────────
 function renderMutantList(fileMutants) {
@@ -1088,6 +1202,7 @@ function selectMutant(id) {
 
   renderDiff(diff);
   if (mutant?.file_path) renderCommand(mutant.file_path);
+  syncUrl();
 }
 
 function renderDiff(diffText) {
@@ -1396,6 +1511,8 @@ function selectPr(prNum) {
   document.querySelectorAll('.files-table tr[onclick]').forEach(tr => {
     tr.style.cursor = 'pointer';
   });
+
+  syncUrl();
 }
 
 function backToPrList() {
@@ -1409,6 +1526,7 @@ function backToPrList() {
     renderFileList();
   }
   renderPrList();
+  syncUrl();
 }
 
 // ── MOBILE SIDEBAR ────────────────────────────────────────────────────────────
@@ -1448,6 +1566,7 @@ function switchView(view) {
     testedFiles      = { ...window._weeklySnapshot.testedFiles };
     renderFileList();
   }
+  syncUrl();
 }
 </script>
 </body>
